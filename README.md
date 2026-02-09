@@ -1,3 +1,7 @@
+[![Python](https://img.shields.io/badge/Python-3.8+-blue)](https://python.org)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red)](https://pytorch.org)
+[![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
+
 # ICSTR-PINN-NMPC
 
 Physics-Informed Neural Network (PINN) based Nonlinear Model Predictive Control (NMPC) for Isothermal Continuous Stirred Tank Reactor (CSTR)
