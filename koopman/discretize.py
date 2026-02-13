@@ -40,11 +40,14 @@ def compute_theoretical_bound(K, dt, max_residual_inf_norm):
     w_bar = max_residual_inf_norm * scaling_factor
     return w_bar
 
-def compute_empirical_bound(A, B, Z, V, Z_next, margin_ratio=1.0):
+def compute_empirical_bound(A, B, Z, V, Z_next, Cx, Cu, margin_ratio=1.0):
     """
     Compute empirical w_bar based on one-step prediction errors on validation data.
     w_k = z_{k+1} - (A z_k + B v_k)
-    w_bar = max_k |w_k|_inf
+    Returns:
+        w_bar_x: max |Cx w_k|
+        w_bar_u: max |Cu w_k|
+        w_bar_v_est: max |w_k|_inf (full state bound, potentially large)
     """
     # Predict Z_next
     # Z: (N, nz), V: (N,), B: (nz, 1) -> V.reshape(-1, 1) @ B.T -> (N, nz)
@@ -53,15 +56,16 @@ def compute_empirical_bound(A, B, Z, V, Z_next, margin_ratio=1.0):
 
     residuals = Z_next - Z_pred
 
-    # Ignore constant state (last column usually, or index of '1')
-    # Since we don't know index here easily without lifting object,
-    # we assume the user handles it or we compute norm over all.
-    # But constant state error should be 0 by construction/definition.
-    # If not 0, it contributes to error.
+    # Project residuals
+    w_x = residuals @ Cx
+    w_u = residuals @ Cu
 
-    # Compute infinity norm for each sample
-    # |w_k|_inf = max_i |w_k[i]|
+    # Compute bounds (99th percentile for robustness against outliers)
+    w_bar_x = np.percentile(np.abs(w_x), 99) * margin_ratio
+    w_bar_u = np.percentile(np.abs(w_u), 99) * margin_ratio
+
+    # Full state bound for reference (or conservative tube calculation)
     w_norms = np.linalg.norm(residuals, ord=np.inf, axis=1)
+    w_bar_inf = np.percentile(w_norms, 99) * margin_ratio
 
-    w_bar = np.max(w_norms) * margin_ratio
-    return w_bar
+    return w_bar_x, w_bar_u, w_bar_inf

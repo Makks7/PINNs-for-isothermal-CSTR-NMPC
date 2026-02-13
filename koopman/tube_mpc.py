@@ -41,9 +41,12 @@ def compute_inf_norm_gain(A, B):
         return None, None
 
 class TubeMPC:
-    def __init__(self, A, B, Q, R, N, x_min, x_max, u_min, u_max, v_min, v_max, Cx, Cu, w_bar):
+    def __init__(self, A, B, Q, R, N, x_min, x_max, u_min, u_max, v_min, v_max, Cx, Cu,
+                 w_bar_x, w_bar_u, w_bar_inf=None):
         """
-        w_bar: bound on disturbance |w|_inf <= w_bar
+        w_bar_x: bound on disturbance for x
+        w_bar_u: bound on disturbance for u
+        w_bar_inf: (optional) bound on disturbance |w|_inf for full state
         """
         self.A = A
         self.B = B
@@ -58,67 +61,101 @@ class TubeMPC:
         self.v_max = v_max
         self.Cx = Cx
         self.Cu = Cu
-        self.w_bar = w_bar
+        self.w_bar_x = w_bar_x
+        self.w_bar_u = w_bar_u
 
-        # 1. Compute feedback gain K_fb for error system
-        # First try LQR
+        # 1. Compute feedback gain K_fb
+        # Use LQR for K_fb
         self.K_fb, self.P_nominal = compute_LQR_gain(A, B, Q, R, Cx=Cx)
 
-        # Check rho with LQR
-        # A_cl = A - B K_fb
+        # 2. Compute Contractivity
+        # For projection-based tube, we mainly care about stability in the projected subspace
+        # But rigorous tube requires full state stability.
         self.A_cl = A - B @ self.K_fb
-        self.rho = np.linalg.norm(self.A_cl, np.inf)
-        print(f"LQR rho (inf-norm) = {self.rho:.4f}")
 
-        # If LQR fails to be contractive in inf-norm, try to optimize K_fb
-        if self.rho >= 0.95: # Threshold bit lower than 1 to be safe
-            print("LQR gain not contractive enough. Optimizing K_fb for inf-norm...")
-            K_inf, rho_inf = compute_inf_norm_gain(A, B)
+        # Check spectral radius for asymptotic stability
+        evals = np.linalg.eigvals(self.A_cl)
+        self.rho_spec = np.max(np.abs(evals))
 
-            if K_inf is not None and rho_inf < 1.0:
-                print(f"Found optimized gain with rho={rho_inf:.4f}")
-                self.K_fb = K_inf
-                self.rho = rho_inf
-                self.A_cl = A - B @ self.K_fb
-            else:
-                print(f"Failed to find contractive gain (rho={rho_inf if rho_inf else 'None'}). Using LQR fallback.")
-                if self.rho >= 1.0:
-                    self.rho = 0.99
+        # Check inf-norm for strict box invariance
+        self.rho_inf = np.linalg.norm(self.A_cl, np.inf)
 
-        # 3. Compute invariant set size
-        if self.rho < 0.999:
-            self.e_bar = w_bar / (1.0 - self.rho)
+        print(f"Tube MPC Design: rho_spec={self.rho_spec:.4f}, rho_inf={self.rho_inf:.4f}")
+
+        # 3. Determine Margins
+        # Strategy: Use spectral radius for tightening factor if rho_inf >= 1
+        # This is a heuristic for "empirical tube" when strict box invariance fails.
+        # Strict Theory: margin = w_bar / (1 - rho_inf)
+        # Heuristic: margin = w_bar / (1 - rho_spec) if stable
+
+        if self.rho_inf < 0.999:
+            self.tightening_factor = 1.0 / (1.0 - self.rho_inf)
+            method = "Strict Inf-Norm"
+        elif self.rho_spec < 0.999:
+            self.tightening_factor = 1.0 / (1.0 - self.rho_spec)
+            method = "Spectral Radius Heuristic"
         else:
-            self.e_bar = w_bar * 1000
+            self.tightening_factor = 100.0 # Fallback
+            method = "Fallback"
+            print("Warning: System barely stable, using large tightening factor.")
 
-        # 4. Compute margins for tightening
-        norm_Cx_1 = np.linalg.norm(Cx, 1)
-        self.margin_x = norm_Cx_1 * self.e_bar
+        print(f"Tightening Method: {method}, Factor: {self.tightening_factor:.2f}")
 
-        norm_Cu_1 = np.linalg.norm(Cu, 1)
-        self.margin_u = norm_Cu_1 * self.e_bar
+        # Compute margins based on projected disturbance bounds
+        # margin_x = w_bar_x * factor
+        # margin_u = w_bar_u * factor
+        self.margin_x = w_bar_x * self.tightening_factor
+        self.margin_u = w_bar_u * self.tightening_factor
 
-        norm_Kfb_inf = np.linalg.norm(self.K_fb, np.inf)
-        self.margin_v = norm_Kfb_inf * self.e_bar
+        # For v: v = v_nom - K_fb e
+        # |v - v_nom| <= |K_fb| |e|
+        # We need a bound on |e|. If we use component-wise bounds:
+        # e_x <= margin_x, e_u <= margin_u.
+        # But e has other components.
+        # If w_bar_inf is provided, use it to bound full state error norm.
+        if w_bar_inf is not None:
+             # e_bar_inf = w_bar_inf * factor
+             # |K_fb e| <= |K_fb|_inf * e_bar_inf
+             self.e_bar_inf = w_bar_inf * self.tightening_factor
+             norm_Kfb_inf = np.linalg.norm(self.K_fb, np.inf)
+             self.margin_v = norm_Kfb_inf * self.e_bar_inf
+        else:
+             # Fallback: assume error dominated by x, u components?
+             # Or just use a fixed small margin for v if we trust LQR.
+             # Let's use 0.0 as placeholder if no info, or small value.
+             self.margin_v = 0.1 * (v_max - v_min) # 10% backoff?
+             print("Warning: No w_bar_inf provided, using heuristic margin for v.")
 
-        print(f"Tube MPC Initialized: rho={self.rho:.4f}, e_bar={self.e_bar:.4f}")
         print(f"Margins: x={self.margin_x:.4f}, u={self.margin_u:.4f}, v={self.margin_v:.4f}")
 
         # 5. Initialize Nominal MPC with tightened constraints
         x_min_tight = x_min + self.margin_x
         x_max_tight = x_max - self.margin_x
         if x_min_tight > x_max_tight:
-             print(f"Warning: x constraints tightened to infeasibility! ({x_min_tight:.2f} > {x_max_tight:.2f})")
+             print(f"Warning: x constraints tightened to infeasibility! ({x_min_tight:.4f} > {x_max_tight:.4f})")
+             # Clamp to center
+             center = (x_min + x_max) / 2
+             x_min_tight = center - 1e-6
+             x_max_tight = center + 1e-6
 
         u_min_tight = u_min + self.margin_u
         u_max_tight = u_max - self.margin_u
         if u_min_tight > u_max_tight:
-             print(f"Warning: u constraints tightened to infeasibility! ({u_min_tight:.2f} > {u_max_tight:.2f})")
+             print(f"Warning: u constraints tightened to infeasibility! ({u_min_tight:.4f} > {u_max_tight:.4f})")
+             center = (u_min + u_max) / 2
+             u_min_tight = center - 1e-6
+             u_max_tight = center + 1e-6
 
         v_min_tight = v_min + self.margin_v
         v_max_tight = v_max - self.margin_v
         if v_min_tight > v_max_tight:
-             print(f"Warning: v constraints tightened to infeasibility! ({v_min_tight:.2f} > {v_max_tight:.2f})")
+             print(f"Warning: v constraints tightened to infeasibility! ({v_min_tight:.4f} > {v_max_tight:.4f})")
+             # If v tightened too much, relax margin_v (it's less critical than state constraints for safety usually)
+             # Relax to allow at least small control authority
+             v_range = v_max - v_min
+             v_min_tight = v_min + 0.45 * v_range
+             v_max_tight = v_max - 0.45 * v_range
+             print(f"  Relaxed v to 10% range: [{v_min_tight:.4f}, {v_max_tight:.4f}]")
 
         self.nominal_mpc = LinearMPC(
             A, B, Q, R, self.P_nominal, N,

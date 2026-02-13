@@ -10,7 +10,7 @@ import time
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from koopman import KoopmanLifting, KoopmanGenerator, discretize_generator
-from koopman.discretize import compute_empirical_bound, compute_theoretical_bound
+from koopman.discretize import compute_empirical_bound
 from koopman.tube_mpc import TubeMPC
 from scipy.integrate import odeint
 
@@ -30,8 +30,6 @@ def train_and_select_model(degrees=[2, 3], lambdas=[1e-5]):
     df = pd.read_csv('koopman_data.csv')
 
     # Split train/val
-    # Trajectory-based split to avoid leakage
-    # Provided data has 'traj_id'
     traj_ids = df['traj_id'].unique()
     np.random.seed(42)
     np.random.shuffle(traj_ids)
@@ -43,7 +41,6 @@ def train_and_select_model(degrees=[2, 3], lambdas=[1e-5]):
     df_train = df[df['traj_id'].isin(train_ids)]
     df_val = df[df['traj_id'].isin(val_ids)]
 
-    # Save temporary train/val csvs
     df_train.to_csv('koopman_train.csv', index=False)
 
     best_model = None
@@ -56,30 +53,25 @@ def train_and_select_model(degrees=[2, 3], lambdas=[1e-5]):
             generator = KoopmanGenerator('koopman_train.csv', degree=d, lambda_reg=lam)
             K, L = generator.fit()
 
-            # Validation
-            dt = df_val['dt'].iloc[0] # Assume constant dt
+            dt = df_val['dt'].iloc[0]
             A, B = discretize_generator(K, L, dt)
 
-            # Validate on val set
             X_val = df_val['x_k'].values
             U_val = df_val['u_k'].values
             V_val = df_val['v_k'].values
             X_next_val = df_val['x_next'].values
             U_next_val = df_val['u_next'].values
 
-            # Lift
             Z_val = generator.lifting.lift(X_val, U_val)
             Z_next_val_true = generator.lifting.lift(X_next_val, U_next_val)
 
-            # Predict
             Z_pred = Z_val @ A.T + V_val.reshape(-1, 1) @ B.T
 
-            # RMSE on x (index of x?)
             idx_x = generator.lifting.get_feature_index(1, 0)
             if idx_x is not None:
                 rmse_x = np.sqrt(np.mean((Z_next_val_true[:, idx_x] - Z_pred[:, idx_x])**2))
             else:
-                rmse_x = np.mean((Z_next_val_true - Z_pred)**2) # Fallback
+                rmse_x = np.mean((Z_next_val_true - Z_pred)**2)
 
             print(f"  RMSE (x): {rmse_x:.6f}")
 
@@ -93,20 +85,15 @@ def train_and_select_model(degrees=[2, 3], lambdas=[1e-5]):
     return best_model, best_params
 
 def run_experiment():
-    # 0. Setup
-    dt = 0.1 # Simulation dt
+    dt = 0.1
 
-    # 1. Model Selection
     if not os.path.exists('koopman_data.csv'):
         print("Error: koopman_data.csv not found.")
         return
 
     (generator, K, L, A, B), params = train_and_select_model(degrees=[2, 3], lambdas=[1e-5])
 
-    # 2. Compute Error Bound (Empirical on Validation Data)
-    # Re-load full data or just validation data
-    # Ideally use held-out test data, but validation is fine for "empirical" bound in this context
-    # Use full data for robust bound estimate?
+    # Compute Component-wise Error Bounds
     df = pd.read_csv('koopman_data.csv')
     X = df['x_k'].values
     U = df['u_k'].values
@@ -117,26 +104,15 @@ def run_experiment():
     Z = generator.lifting.lift(X, U)
     Z_next = generator.lifting.lift(X_next, U_next)
 
-    # Empirical w_bar (99% quantile)
-    w_bar = compute_empirical_bound(A, B, Z, V, Z_next, margin_ratio=1.0)
-    # Using 99th percentile logic inside compute_empirical_bound?
-    # No, it uses max. Let's use percentile here manually if we want robustness against outliers.
-    Z_pred = Z @ A.T + V.reshape(-1, 1) @ B.T
-    residuals = Z_next - Z_pred
-    w_norms = np.linalg.norm(residuals, ord=np.inf, axis=1)
-    w_bar_95 = np.percentile(w_norms, 95)
-    print(f"Empirical w_bar (Max): {np.max(w_norms):.6f}")
-    print(f"Empirical w_bar (95%): {w_bar_95:.6f}")
+    Cx, Cu = generator.lifting.get_output_matrices()
 
-    # For demonstration purposes, we cap w_bar if it's too large to find a tube
-    # In practice, this means we accept some risk of constraint violation
-    if w_bar_95 > 1e-2:
-        print(f"Warning: w_bar_95 ({w_bar_95:.6f}) is large. Clipping to 1e-3 for feasibility demo.")
-        w_bar_used = 1e-3
-    else:
-        w_bar_used = w_bar_95
+    w_bar_x, w_bar_u, w_bar_inf = compute_empirical_bound(A, B, Z, V, Z_next, Cx, Cu, margin_ratio=1.0)
 
-    # 3. Setup MPC
+    print(f"Empirical w_bar_x: {w_bar_x:.6f}")
+    print(f"Empirical w_bar_u: {w_bar_u:.6f}")
+    print(f"Empirical w_bar_inf (full state): {w_bar_inf:.6f}")
+
+    # Setup MPC
     x_min, x_max = 0.0, 1.0
     u_min, u_max = 0.0, 3.0
     v_min, v_max = -2.0, 2.0
@@ -145,16 +121,14 @@ def run_experiment():
     R = 0.1
     N = 20
 
-    Cx, Cu = generator.lifting.get_output_matrices()
-
     print("Initializing Tube MPC...")
     mpc = TubeMPC(
         A, B, Q, R, N,
         x_min, x_max, u_min, u_max, v_min, v_max,
-        Cx, Cu, w_bar_used
+        Cx, Cu, w_bar_x, w_bar_u, w_bar_inf
     )
 
-    # 4. Simulation
+    # Simulation
     T_sim = 50.0
     n_steps = int(T_sim / dt)
     t_eval = np.linspace(0, T_sim, n_steps+1)
@@ -162,9 +136,6 @@ def run_experiment():
     x0 = 0.2
     u0 = 0.5
     current_state = [x0, u0]
-
-    # Lift initial state
-    z_current = generator.lifting.lift([x0], [u0])[0]
 
     state_hist = []
     input_hist = []
@@ -174,21 +145,21 @@ def run_experiment():
 
     print(f"Starting simulation: x0={x0}, x_sp={x_sp}...")
 
+    infeasible_count = 0
+
     for i in range(n_steps):
-        # Update z from current state (perfect measurement assumption for state)
-        # In reality, z should be updated via estimator or lifted from x, u
         z_curr = generator.lifting.lift([current_state[0]], [current_state[1]])[0]
 
-        # MPC Step
         v_opt, z_pred = mpc.solve(z_curr, x_sp)
 
         if v_opt is None:
-            print(f"MPC Infeasible at step {i}")
-            v_apply = 0.0
+            infeasible_count += 1
+            if infeasible_count <= 5:
+                print(f"MPC Infeasible at step {i}")
+            v_apply = 0.0 # Emergency fallback
         else:
             v_apply = v_opt if np.isscalar(v_opt) else v_opt[0]
 
-        # Plant Step
         t_span = [0, dt]
         sol = odeint(cstr_dynamics, current_state, t_span, args=(v_apply,))
         next_state = sol[-1]
@@ -201,12 +172,11 @@ def run_experiment():
     end_time = time.time()
     avg_time = (end_time - start_time) / n_steps
     print(f"Simulation finished. Avg time per step: {avg_time*1000:.2f} ms")
+    print(f"Total Infeasible Steps: {infeasible_count}/{n_steps}")
 
-    # 5. Analysis & Save
     state_hist = np.array(state_hist)
     input_hist = np.array(input_hist)
 
-    # Metrics
     x_traj = state_hist[:, 0]
     iae = np.sum(np.abs(x_traj - x_sp)) * dt
     energy = np.sum(input_hist**2) * dt
@@ -214,7 +184,6 @@ def run_experiment():
     print(f"IAE: {iae:.4f}")
     print(f"Control Energy: {energy:.4f}")
 
-    # Save data
     results_df = pd.DataFrame({
         'time': t_eval[:-1],
         'x': x_traj,
@@ -224,13 +193,14 @@ def run_experiment():
     })
     results_df.to_csv('experiments/koopman_mpc_data.csv', index=False)
 
-    # Save Config
     config = {
         'degree': params['degree'],
         'lambda': params['lambda'],
-        'w_bar': w_bar_used,
-        'rho': mpc.rho,
-        'e_bar': mpc.e_bar,
+        'w_bar_x': w_bar_x,
+        'rho_spec': mpc.rho_spec,
+        'tightening_factor': mpc.tightening_factor,
+        'margin_x': mpc.margin_x,
+        'margin_u': mpc.margin_u,
         'IAE': iae,
         'Energy': energy,
         'dt': dt,
@@ -239,7 +209,6 @@ def run_experiment():
     with open('experiments/run_metadata.json', 'w') as f:
         json.dump(config, f, indent=4)
 
-    # Plot
     plt.figure(figsize=(10, 10))
 
     plt.subplot(3, 1, 1)
