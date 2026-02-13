@@ -1,16 +1,39 @@
 import numpy as np
 
 class KoopmanLifting:
-    def __init__(self):
-        self.feature_names = ['x', 'u', 'xu', '1', 'x2', 'u2']
-        self.n_z = len(self.feature_names)
+    def __init__(self, degree=2, C_Ai=1.0, k=0.028):
+        self.degree = degree
+        self.C_Ai = C_Ai
+        self.k = k
+        self.powers = self._build_monomial_powers(degree)
+        self.n_z = len(self.powers)
+        self.feature_names = [f"x^{p[0]}u^{p[1]}" for p in self.powers]
+
+    def _build_monomial_powers(self, d):
+        """
+        Returns list of (i, j) tuples such that i + j <= d.
+        Sorted by total degree, then by x power (descending).
+        """
+        powers = []
+        for total_deg in range(d + 1):
+            # For each degree, sort by x power descending: (deg, 0), (deg-1, 1), ..., (0, deg)
+            for i in range(total_deg, -1, -1):
+                j = total_deg - i
+                powers.append((i, j))
+        return powers
+
+    def get_feature_index(self, i, j):
+        try:
+            return self.powers.index((i, j))
+        except ValueError:
+            return None
 
     def lift(self, X, U):
         """
         Lift state x and input u to z space.
         Args:
-            X: (N,) array of x (C_A)
-            U: (N,) array of u
+            X: (N,) array or scalar
+            U: (N,) array or scalar
         Returns:
             Z: (N, n_z) array
         """
@@ -23,18 +46,74 @@ class KoopmanLifting:
         N = len(X)
         Z = np.zeros((N, self.n_z))
 
-        # z = [x, u, xu, 1, x2, u2]
-        Z[:, 0] = X
-        Z[:, 1] = U
-        Z[:, 2] = X * U
-        Z[:, 3] = 1.0
-        Z[:, 4] = X**2
-        Z[:, 5] = U**2
+        for idx, (i, j) in enumerate(self.powers):
+            # Compute x^i * u^j
+            if i == 0 and j == 0:
+                Z[:, idx] = 1.0
+            elif i == 0:
+                Z[:, idx] = U**j
+            elif j == 0:
+                Z[:, idx] = X**i
+            else:
+                Z[:, idx] = (X**i) * (U**j)
 
         return Z
 
-    def get_feature_indices(self):
-        return {name: i for i, name in enumerate(self.feature_names)}
+    def psi_dot(self, X, U, V):
+        """
+        Analytical time derivative of lifted state z.
+        \dot{z} = \frac{d}{dt} \psi(x, u)
+        Args:
+            X, U, V: (N,) arrays
+        Returns:
+            Z_dot: (N, n_z) array
+        """
+        X = np.atleast_1d(X).flatten()
+        U = np.atleast_1d(U).flatten()
+        V = np.atleast_1d(V).flatten()
+
+        N = len(X)
+        Z_dot = np.zeros((N, self.n_z))
+
+        # Physics:
+        # \dot x = u(C_Ai - x) - k x
+        dx_dt = U * (self.C_Ai - X) - self.k * X
+        # \dot u = v
+        du_dt = V
+
+        for idx, (i, j) in enumerate(self.powers):
+            # \frac{d}{dt}(x^i u^j) = i x^{i-1} u^j \dot x + j x^i u^{j-1} \dot u
+
+            term1 = np.zeros(N)
+            term2 = np.zeros(N)
+
+            # Term 1: derivative wrt x -> i * x^(i-1) * u^j * dx_dt
+            if i > 0:
+                if i == 1:
+                    d_x_part = np.ones(N)
+                else:
+                    d_x_part = X**(i-1)
+
+                if j > 0:
+                    d_x_part *= (U**j)
+
+                term1 = i * d_x_part * dx_dt
+
+            # Term 2: derivative wrt u -> j * x^i * u^(j-1) * du_dt
+            if j > 0:
+                if j == 1:
+                    d_u_part = np.ones(N)
+                else:
+                    d_u_part = U**(j-1)
+
+                if i > 0:
+                    d_u_part *= (X**i)
+
+                term2 = j * d_u_part * du_dt # du_dt is V
+
+            Z_dot[:, idx] = term1 + term2
+
+        return Z_dot
 
     def get_output_matrices(self):
         """
@@ -43,9 +122,12 @@ class KoopmanLifting:
         Cx = np.zeros(self.n_z)
         Cu = np.zeros(self.n_z)
 
-        # x is index 0
-        Cx[0] = 1.0
-        # u is index 1
-        Cu[1] = 1.0
+        idx_x = self.get_feature_index(1, 0)
+        idx_u = self.get_feature_index(0, 1)
+
+        if idx_x is not None:
+            Cx[idx_x] = 1.0
+        if idx_u is not None:
+            Cu[idx_u] = 1.0
 
         return Cx, Cu

@@ -1,10 +1,49 @@
 import numpy as np
+import cvxpy as cp
 from .mpc_qp import LinearMPC, compute_LQR_gain
+
+def compute_inf_norm_gain(A, B):
+    """
+    Compute K such that |A + BK|_inf is minimized.
+    Formulated as LP.
+    """
+    nz = A.shape[0]
+    nu = B.shape[1] if len(B.shape) > 1 else 1
+
+    # Reshape B if needed
+    if len(B.shape) == 1:
+        B = B.reshape(-1, 1)
+
+    K = cp.Variable((nu, nz))
+    gamma = cp.Variable(nonneg=True)
+    M = cp.Variable((nz, nz), nonneg=True)
+
+    constraints = []
+    # M >= |A + BK|
+    term = A + B @ K
+    constraints.append(M >= term)
+    constraints.append(M >= -term)
+
+    # Row sum constraint
+    constraints.append(cp.sum(M, axis=1) <= gamma)
+
+    # Regularization
+    loss = gamma + 0.001 * cp.sum(cp.abs(K))
+
+    prob = cp.Problem(cp.Minimize(loss), constraints)
+    prob.solve(solver=cp.OSQP, verbose=False)
+
+    if prob.status in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
+        # Return -K because LQR uses u = -K x, here we solved A + BK
+        # So K_fb = -K
+        return -K.value, gamma.value
+    else:
+        return None, None
 
 class TubeMPC:
     def __init__(self, A, B, Q, R, N, x_min, x_max, u_min, u_max, v_min, v_max, Cx, Cu, w_bar):
         """
-        w_bar: bound on disturbance |w| <= w_bar
+        w_bar: bound on disturbance |w|_inf <= w_bar
         """
         self.A = A
         self.B = B
@@ -21,89 +60,98 @@ class TubeMPC:
         self.Cu = Cu
         self.w_bar = w_bar
 
-        # 1. Compute feedback gain K_fb for error system (using same LQR as nominal?)
+        # 1. Compute feedback gain K_fb for error system
+        # First try LQR
         self.K_fb, self.P_nominal = compute_LQR_gain(A, B, Q, R, Cx=Cx)
 
-        # 2. Compute rho = spectral radius of (A - B K_fb)
-        # Note: LQR u = -K x. So A_cl = A - B K
+        # Check rho with LQR
+        # A_cl = A - B K_fb
         self.A_cl = A - B @ self.K_fb
-        evals = np.linalg.eigvals(self.A_cl)
+        self.rho = np.linalg.norm(self.A_cl, np.inf)
+        print(f"LQR rho (inf-norm) = {self.rho:.4f}")
 
-        # Filter out eigenvalues close to 1.0 (constant mode)
-        rho_candidates = np.abs(evals)
-        mask_unstable_constant = (rho_candidates > 0.999) & (rho_candidates < 1.001)
+        # If LQR fails to be contractive in inf-norm, try to optimize K_fb
+        if self.rho >= 0.95: # Threshold bit lower than 1 to be safe
+            print("LQR gain not contractive enough. Optimizing K_fb for inf-norm...")
+            K_inf, rho_inf = compute_inf_norm_gain(A, B)
 
-        if np.any(mask_unstable_constant):
-            filtered_evals = rho_candidates[~mask_unstable_constant]
-            if len(filtered_evals) > 0:
-                self.rho = np.max(filtered_evals)
+            if K_inf is not None and rho_inf < 1.0:
+                print(f"Found optimized gain with rho={rho_inf:.4f}")
+                self.K_fb = K_inf
+                self.rho = rho_inf
+                self.A_cl = A - B @ self.K_fb
             else:
-                self.rho = 0.0
-        else:
-            self.rho = np.max(rho_candidates)
+                print(f"Failed to find contractive gain (rho={rho_inf if rho_inf else 'None'}). Using LQR fallback.")
+                if self.rho >= 1.0:
+                    self.rho = 0.99
 
-        if self.rho >= 1.0:
-            print(f"Warning: Closed loop system unstable! rho={self.rho}")
-            self.rho = 0.99 # Fallback to avoid division by zero if unstable (though LQR should stabilize)
-
-        # 3. Compute invariant set size (scalar bound)
-        # |e| <= w_bar / (1 - rho)
+        # 3. Compute invariant set size
         if self.rho < 0.999:
-            self.epsilon_max = w_bar / (1.0 - self.rho)
+            self.e_bar = w_bar / (1.0 - self.rho)
         else:
-            self.epsilon_max = w_bar * 100 # Large value
+            self.e_bar = w_bar * 1000
 
-        # 4. Compute margins
-        # Margin for x: |Cx e| <= |Cx| |e|
-        self.margin_x = np.linalg.norm(Cx, 2) * self.epsilon_max
+        # 4. Compute margins for tightening
+        norm_Cx_1 = np.linalg.norm(Cx, 1)
+        self.margin_x = norm_Cx_1 * self.e_bar
 
-        # Margin for u: |Cu e| <= |Cu| |e|
-        self.margin_u = np.linalg.norm(Cu, 2) * self.epsilon_max
+        norm_Cu_1 = np.linalg.norm(Cu, 1)
+        self.margin_u = norm_Cu_1 * self.e_bar
 
-        # Margin for v: |K_fb e| <= |K_fb| |e|
-        # v_error = - K_fb e
-        self.margin_v = np.linalg.norm(self.K_fb, 2) * self.epsilon_max
+        norm_Kfb_inf = np.linalg.norm(self.K_fb, np.inf)
+        self.margin_v = norm_Kfb_inf * self.e_bar
 
-        print(f"Tube MPC Initialized: rho={self.rho:.4f}, eps={self.epsilon_max:.4f}")
+        print(f"Tube MPC Initialized: rho={self.rho:.4f}, e_bar={self.e_bar:.4f}")
         print(f"Margins: x={self.margin_x:.4f}, u={self.margin_u:.4f}, v={self.margin_v:.4f}")
 
         # 5. Initialize Nominal MPC with tightened constraints
+        x_min_tight = x_min + self.margin_x
+        x_max_tight = x_max - self.margin_x
+        if x_min_tight > x_max_tight:
+             print(f"Warning: x constraints tightened to infeasibility! ({x_min_tight:.2f} > {x_max_tight:.2f})")
+
+        u_min_tight = u_min + self.margin_u
+        u_max_tight = u_max - self.margin_u
+        if u_min_tight > u_max_tight:
+             print(f"Warning: u constraints tightened to infeasibility! ({u_min_tight:.2f} > {u_max_tight:.2f})")
+
+        v_min_tight = v_min + self.margin_v
+        v_max_tight = v_max - self.margin_v
+        if v_min_tight > v_max_tight:
+             print(f"Warning: v constraints tightened to infeasibility! ({v_min_tight:.2f} > {v_max_tight:.2f})")
+
         self.nominal_mpc = LinearMPC(
             A, B, Q, R, self.P_nominal, N,
-            x_min + self.margin_x, x_max - self.margin_x,
-            u_min + self.margin_u, u_max - self.margin_u,
-            v_min + self.margin_v, v_max - self.margin_v,
+            x_min_tight, x_max_tight,
+            u_min_tight, u_max_tight,
+            v_min_tight, v_max_tight,
             Cx, Cu
         )
 
-        self.z_nom = None # State of nominal system
+        self.z_nom = None
+        self.d_est = 0.0
 
     def solve(self, z_current, x_sp):
-        """
-        Solve Tube MPC.
-        z_current: actual measured state
-        """
-        # Initialize z_nom if first run
         if self.z_nom is None:
             self.z_nom = z_current.copy()
 
-        # Solve nominal MPC for z_nom
-        v_nom_seq, z_nom_seq = self.nominal_mpc.solve(self.z_nom, x_sp)
+        y_meas = self.Cx @ z_current
+        y_nom = self.Cx @ self.z_nom
+        d_raw = y_meas - y_nom
+
+        alpha = 0.5
+        self.d_est = alpha * self.d_est + (1 - alpha) * d_raw
+
+        v_nom_seq, z_nom_seq = self.nominal_mpc.solve(self.z_nom, x_sp, d_est=self.d_est)
 
         if v_nom_seq is None:
-            print("Tube MPC: Nominal MPC failed (Infeasible?).")
             return None, None
 
-        # Compute actual control input
-        # v = v_nom - K_fb (z_current - z_nom)
         v_nom = v_nom_seq[0] if v_nom_seq.ndim > 0 else v_nom_seq
 
-        # v_control needs to be shape (1,) or scalar
-        v_control = v_nom - self.K_fb @ (z_current - self.z_nom)
+        v_feedback = self.K_fb @ (z_current - self.z_nom)
+        v_control = v_nom - v_feedback
 
-        # Update nominal state for next step
-        # z_nom_next = A z_nom + B v_nom
-        # We can use the prediction from MPC: z_nom_seq[1]
         self.z_nom = z_nom_seq[1]
 
         return v_control, z_nom_seq

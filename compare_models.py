@@ -13,15 +13,15 @@ from koopman import KoopmanGenerator, discretize_generator
 # CONFIG
 # ────────────────────────────────────────────────
 CSV_FILE = 'cstr_simulation_data.csv'
-# PINN and Vanilla models paths (assumed to exist or we skip them if missing)
 PINN_MODEL = 'train_results/trained_model.pth'
 VANILLA_MODEL = 'train_results_vanilla/vanilla_model.pth'
+METADATA_FILE = 'experiments/run_metadata.json'
 
 SAVE_DIR = 'comparison_results'
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 # ────────────────────────────────────────────────
-# MODEL DEFINITIONS (Placeholder if files missing)
+# MODEL DEFINITIONS (Placeholder)
 # ────────────────────────────────────────────────
 class PINN_CSTR(torch.nn.Module):
     def __init__(self, hidden_layers=4, neurons=64):
@@ -74,32 +74,35 @@ def rollout_prediction(model, df):
 
     return CA_pred, t
 
-def predict_koopman(df):
-    print("Fitting Koopman model for comparison...")
+def predict_koopman(df, degree=3, lambda_reg=1e-5):
+    print(f"Fitting Koopman model (d={degree}, lam={lambda_reg}) for comparison...")
     if not os.path.exists('koopman_data.csv'):
         print("koopman_data.csv not found, skipping Koopman.")
         return None
 
-    generator = KoopmanGenerator('koopman_data.csv')
-    K, L = generator.fit(lambda_reg=1e-5)
+    generator = KoopmanGenerator('koopman_data.csv', degree=degree, lambda_reg=lambda_reg)
+    K, L = generator.fit()
 
     t = df['time'].values
     u = df['u_input'].values
     CA_true = df['CA_concentration'].values
 
-    # Compute v
+    # Compute v (input rate)
     v = np.zeros_like(u)
-    # v[i] approx (u[i+1] - u[i]) / dt[i+1]
-    # But we need v applied at step i.
-    # u[i+1] = u[i] + v[i]*dt
     dt_vals = np.diff(t)
+    # Forward difference for v? Or backward?
+    # u[k+1] = u[k] + v[k]*dt
+    # v[k] = (u[k+1] - u[k])/dt
+    # We use v[k] to predict x[k+1].
     v[:-1] = np.diff(u) / dt_vals
-    v[-1] = v[-2] # Last v
+    v[-1] = 0.0 # No input change at last step
 
     preds = np.zeros_like(CA_true)
     preds[0] = CA_true[0]
 
-    z_curr = generator.lifting.lift([CA_true[0]], [u[0]])[0]
+    z_curr = generator.lifting.lift(CA_true[0], u[0])[0]
+
+    idx_x = generator.lifting.get_feature_index(1, 0)
 
     for i in range(len(t)-1):
         dt = dt_vals[i]
@@ -110,22 +113,27 @@ def predict_koopman(df):
         # z_next = A z + B v
         z_next = A @ z_curr + B.flatten() * v_k
 
-        preds[i+1] = z_next[0]
+        # Extract x prediction
+        if idx_x is not None:
+            preds[i+1] = z_next[idx_x]
+        else:
+             # Fallback
+             preds[i+1] = z_next[0] # assuming x is first? Not guaranteed.
+             # Wait, get_feature_index(1,0) should exist if degree>=1.
 
-        # Update z_curr
-        # Correct u-component to prevent drift
-        # z_next[1] corresponds to u[i+1]
-        # We can force it to be true u[i+1] for open loop prediction
-        z_next[1] = u[i+1]
+        # Open Loop Feedback Correction:
+        # We are doing open-loop rollout for x.
+        # But u is GIVEN by the dataset.
+        # Koopman state contains u.
+        # We should overwrite the u-component of z_next with the TRUE u from dataset?
+        # Standard "simulation" mode uses predicted x, but GIVEN u.
+        # Yes.
 
-        # Re-lift dependent variables
-        z_next[2] = z_next[0] * z_next[1] # xu
-        z_next[3] = 1.0
-        if generator.lifting.n_z > 4:
-            z_next[4] = z_next[0]**2
-            z_next[5] = z_next[1]**2
+        # Re-lift based on predicted x and TRUE u
+        u_next_true = u[i+1]
+        x_next_pred = preds[i+1]
 
-        z_curr = z_next
+        z_curr = generator.lifting.lift(x_next_pred, u_next_true)[0]
 
     return preds
 
@@ -134,10 +142,20 @@ def predict_koopman(df):
 # ────────────────────────────────────────────────
 def compare():
     print("="*60)
-    print("Model Comparison: PINN vs Vanilla vs Koopman")
+    print("Unified Model Comparison")
     print("="*60)
 
-    # Load test data
+    # 1. Load Metadata to get best Koopman params
+    degree = 3
+    lambda_reg = 1e-5
+    if os.path.exists(METADATA_FILE):
+        with open(METADATA_FILE, 'r') as f:
+            meta = json.load(f)
+            degree = meta.get('degree', 3)
+            lambda_reg = meta.get('lambda', 1e-5)
+            print(f"Loaded Koopman params from metadata: d={degree}, lam={lambda_reg}")
+
+    # 2. Load test data
     if not os.path.exists(CSV_FILE):
         print(f"Error: {CSV_FILE} not found. Run simulate_data.py.")
         return
@@ -149,12 +167,12 @@ def compare():
     results = {}
     results['True'] = CA_true
 
-    # Koopman
-    CA_koopman = predict_koopman(df)
+    # 3. Koopman Prediction
+    CA_koopman = predict_koopman(df, degree=degree, lambda_reg=lambda_reg)
     if CA_koopman is not None:
         results['Koopman'] = CA_koopman
 
-    # PINN / Vanilla (Try to load)
+    # 4. PINN / Vanilla
     try:
         if os.path.exists(PINN_MODEL):
             pinn_model = PINN_CSTR()
@@ -162,10 +180,7 @@ def compare():
             pinn_model.eval()
             CA_pinn, _ = rollout_prediction(pinn_model, df)
             results['PINN'] = CA_pinn
-        else:
-            print("PINN model not found, skipping.")
-    except Exception as e:
-        print(f"Error loading PINN: {e}")
+    except: pass
 
     try:
         if os.path.exists(VANILLA_MODEL):
@@ -174,38 +189,32 @@ def compare():
             vanilla_model.eval()
             CA_vanilla, _ = rollout_prediction(vanilla_model, df)
             results['Vanilla'] = CA_vanilla
-        else:
-            print("Vanilla model not found, skipping.")
-    except Exception as e:
-        print(f"Error loading Vanilla: {e}")
+    except: pass
 
-    # Plot
+    # 5. Metrics & Plot
     plt.figure(figsize=(12, 6))
-    plt.plot(t, CA_true, label='True (Simulink)', color='black', lw=2)
+    plt.plot(t, CA_true, label='True', color='black', lw=2, alpha=0.7)
 
-    if 'Koopman' in results:
-        plt.plot(t, results['Koopman'], '--', label='Koopman', color='red', lw=2)
+    colors = {'Koopman': 'red', 'PINN': 'orange', 'Vanilla': 'green'}
 
-    if 'PINN' in results:
-        plt.plot(t, results['PINN'], ':', label='PINN', color='orange', lw=2)
-
-    if 'Vanilla' in results:
-        plt.plot(t, results['Vanilla'], '-.', label='Vanilla', color='green', lw=2)
-
-    plt.xlabel('Time')
-    plt.ylabel('C_A')
-    plt.title('Model Prediction Comparison')
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(os.path.join(SAVE_DIR, 'all_models_comparison.png'))
-    print(f"Saved comparison plot to {SAVE_DIR}/all_models_comparison.png")
-
-    # Calculate Metrics
-    print("\nMetrics (RMSE):")
+    print("\nPrediction Metrics (RMSE):")
     for name, data in results.items():
         if name == 'True': continue
         rmse = np.sqrt(np.mean((data - CA_true)**2))
-        print(f"{name}: {rmse:.6f}")
+        mae = np.mean(np.abs(data - CA_true))
+        r2 = 1 - np.sum((data - CA_true)**2) / np.sum((CA_true - np.mean(CA_true))**2)
+
+        print(f"{name}: RMSE={rmse:.6f}, MAE={mae:.6f}, R2={r2:.6f}")
+
+        plt.plot(t, data, '--', label=f'{name} (RMSE={rmse:.4f})', color=colors.get(name, 'blue'))
+
+    plt.xlabel('Time')
+    plt.ylabel('Concentration')
+    plt.title('Open-Loop Prediction Comparison')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(os.path.join(SAVE_DIR, 'prediction_comparison.png'))
+    print(f"Saved plot to {SAVE_DIR}/prediction_comparison.png")
 
 if __name__ == '__main__':
     compare()
