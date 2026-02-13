@@ -39,7 +39,7 @@ def compute_LQR_gain(A, B, Q, R, Cx=None):
     return K, P
 
 class LinearMPC:
-    def __init__(self, A, B, Q, R, P, N, x_min, x_max, u_min, u_max, v_min, v_max, Cx, Cu):
+    def __init__(self, A, B, Q, R, P, N, x_min, x_max, u_min, u_max, v_min, v_max, Cx, Cu, lifting=None):
         self.A = A
         self.B = B
         self.Q = Q
@@ -54,6 +54,7 @@ class LinearMPC:
         self.v_max = v_max
         self.Cx = Cx
         self.Cu = Cu
+        self.lifting = lifting
 
         self.nz = A.shape[0]
         self.nu = B.shape[1] if len(B.shape) > 1 else 1
@@ -84,30 +85,15 @@ class LinearMPC:
         else:
              u_ss = 0.0
 
-        z_ss = np.zeros(self.nz)
-        # We need to know feature mapping to construct z_ss correctly.
-        # This class assumes a specific lifting structure if we hardcode indices.
-        # Ideally, we should use a method from KoopmanLifting to invert/construct.
-        # But here we can use a heuristic or pass z_ss from outside.
-        # For now, let's assume the basic lifting [x, u, ...] is always present at indices 0, 1?
-        # No, KoopmanLifting order depends on degree.
-        # Wait, get_feature_index logic is in KoopmanLifting.
-        # LinearMPC doesn't know about KoopmanLifting instance.
-        # Use Cx, Cu to identify indices?
-        # Cx has 1.0 at x index.
-        idx_x = np.argmax(np.abs(self.Cx))
-        idx_u = np.argmax(np.abs(self.Cu))
-
-        z_ss[idx_x] = x_sp_eff
-        z_ss[idx_u] = u_ss
-
-        # We can't easily fill higher order terms (xu, x^2) without lifting function.
-        # However, for Regulation, we usually penalize x deviation.
-        # If P matrix is consistent, we should compute z_ss correctly.
-        # Or we only penalize x and u deviations in terminal cost?
-        # Or we rely on the fact that if x, u are close, z is close.
-        # Let's fill what we can.
-        # If we have P from LQR, it penalizes z.
+        if self.lifting is not None:
+            z_ss = self.lifting.lift_one(x_sp_eff, u_ss)
+        else:
+            z_ss = np.zeros(self.nz)
+            # Use Cx, Cu to identify indices?
+            idx_x = np.argmax(np.abs(self.Cx))
+            idx_u = np.argmax(np.abs(self.Cu))
+            z_ss[idx_x] = x_sp_eff
+            z_ss[idx_u] = u_ss
 
         for k in range(self.N):
             # Stage cost: Q(x - x_sp)^2 + R v^2
@@ -134,13 +120,6 @@ class LinearMPC:
             constraints.append(V[k] <= self.v_max)
 
         # Terminal cost
-        # We use z_ss as target.
-        # Note: z_ss is incomplete (higher order terms are 0).
-        # This might bias the terminal cost.
-        # But typically terminal cost weight on higher order terms is small if Q only penalizes x.
-        # Q_z = Cx^T Q Cx. P comes from Q_z.
-        # If Q only on x, P handles z such that x is regulated.
-        # So deviation in 'xu' is only penalized insofar as it affects future 'x'.
         cost += cp.quad_form(Z[self.N] - z_ss, self.P)
 
         prob = cp.Problem(cp.Minimize(cost), constraints)

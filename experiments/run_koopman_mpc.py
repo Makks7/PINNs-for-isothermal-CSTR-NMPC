@@ -106,11 +106,20 @@ def run_experiment():
 
     Cx, Cu = generator.lifting.get_output_matrices()
 
-    w_bar_x, w_bar_u, w_bar_inf = compute_empirical_bound(A, B, Z, V, Z_next, Cx, Cu, margin_ratio=1.0)
+    # Use output residuals for w_bar
+    Z_pred = Z @ A.T + V.reshape(-1, 1) @ B.T
 
-    print(f"Empirical w_bar_x: {w_bar_x:.6f}")
-    print(f"Empirical w_bar_u: {w_bar_u:.6f}")
-    print(f"Empirical w_bar_inf (full state): {w_bar_inf:.6f}")
+    x_pred = Z_pred @ Cx
+    u_pred = Z_pred @ Cu
+    res_x = X_next - x_pred
+    res_u = U_next - u_pred
+
+    # Use 80th percentile for less conservative bounds as per prompt suggestion
+    w_bar_x = np.percentile(np.abs(res_x), 80)
+    w_bar_u = np.percentile(np.abs(res_u), 80)
+
+    print(f"Empirical w_bar_x (80%): {w_bar_x:.6f}")
+    print(f"Empirical w_bar_u (80%): {w_bar_u:.6f}")
 
     # Setup MPC
     x_min, x_max = 0.0, 1.0
@@ -125,7 +134,7 @@ def run_experiment():
     mpc = TubeMPC(
         A, B, Q, R, N,
         x_min, x_max, u_min, u_max, v_min, v_max,
-        Cx, Cu, w_bar_x, w_bar_u, w_bar_inf
+        Cx, Cu, w_bar_x, w_bar_u, lifting=generator.lifting
     )
 
     # Simulation
@@ -156,7 +165,7 @@ def run_experiment():
             infeasible_count += 1
             if infeasible_count <= 5:
                 print(f"MPC Infeasible at step {i}")
-            v_apply = 0.0 # Emergency fallback
+            v_apply = 0.0
         else:
             v_apply = v_opt if np.isscalar(v_opt) else v_opt[0]
 
@@ -183,6 +192,8 @@ def run_experiment():
 
     print(f"IAE: {iae:.4f}")
     print(f"Control Energy: {energy:.4f}")
+    print(f"Final u: {state_hist[-1, 1]:.4f}")
+    print(f"Target u_ss: {0.028*0.8/0.2:.4f}")
 
     results_df = pd.DataFrame({
         'time': t_eval[:-1],

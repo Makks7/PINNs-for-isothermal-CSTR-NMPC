@@ -59,6 +59,37 @@ class KoopmanLifting:
 
         return Z
 
+    def lift_one(self, x, u):
+        return self.lift(np.array([x]), np.array([u]))[0]
+
+    def project(self, z, Cx=None, Cu=None):
+        z = np.asarray(z).flatten()
+
+        # Determine x and u from z
+        # Method 1: Use Cx, Cu if provided
+        if Cx is not None:
+            x = float(np.dot(Cx, z))
+        else:
+            # Fallback: Assume index 1 is x (based on current ordering for d>=1)
+            # x index is (1,0). get_feature_index(1,0) should return correct index.
+            idx_x = self.get_feature_index(1, 0)
+            if idx_x is not None:
+                x = z[idx_x]
+            else:
+                x = 0.0 # Should not happen
+
+        if Cu is not None:
+            u = float(np.dot(Cu, z))
+        else:
+            # Fallback: Assume index 2 is u (based on current ordering for d>=1)
+            idx_u = self.get_feature_index(0, 1)
+            if idx_u is not None:
+                u = z[idx_u]
+            else:
+                u = 0.0
+
+        return self.lift_one(x, u)
+
     def psi_dot(self, X, U, V):
         """
         Analytical time derivative of lifted state z.
